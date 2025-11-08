@@ -42,13 +42,15 @@ type instance struct {
 	debug      bool
 	baseVM     string
 	vmName     string
-	sshPort    int
 	rpcPort    int
-	sshuser    string
-	sshkey     string
 	timeouts   targets.Timeouts
 	serialPath string
 	closed     chan bool
+	os         string
+	merger     *vmimpl.OutputMerger
+	rpipe      io.ReadCloser
+	wpipe      io.WriteCloser
+	vmimpl.SSHOptions
 }
 
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
@@ -79,12 +81,22 @@ func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.I
 		debug:      pool.env.Debug,
 		baseVM:     pool.cfg.BaseVM,
 		vmName:     vmName,
-		sshuser:    pool.env.SSHUser,
-		sshkey:     pool.env.SSHKey,
+		os:         pool.env.OS,
 		timeouts:   pool.env.Timeouts,
 		serialPath: serialPath,
 		closed:     make(chan bool),
+		SSHOptions: vmimpl.SSHOptions{
+			Addr: "localhost",
+			Port: 0,
+			Key:  pool.env.SSHKey,
+			User: pool.env.SSHUser,
+		},
 	}
+	rp, wp, err := osutil.LongPipe()
+	if err != nil {
+		return nil, err
+	}
+	inst.rpipe, inst.wpipe = rp, wp
 	if err := inst.clone(); err != nil {
 		return nil, err
 	}
@@ -106,9 +118,9 @@ func (inst *instance) clone() error {
 		}
 		return err
 	}
-	inst.sshPort = vmimpl.UnusedTCPPort()
-	rule := fmt.Sprintf("syzkaller_pf_%d", inst.sshPort)
-	natArg := fmt.Sprintf("%s,tcp,,%d,,22", rule, inst.sshPort)
+	inst.SSHOptions.Port = vmimpl.UnusedTCPPort()
+	rule := fmt.Sprintf("syzkaller_pf_%d", inst.SSHOptions.Port)
+	natArg := fmt.Sprintf("%s,tcp,,%d,,22", rule, inst.SSHOptions.Port)
 	if inst.debug {
 		log.Logf(0, "setting NAT rule %q", natArg)
 	}
@@ -120,7 +132,7 @@ func (inst *instance) clone() error {
 		return err
 	}
 	if inst.debug {
-		log.Logf(0, "SSH NAT forwarding: host 127.0.0.1:%d -> guest:22", inst.sshPort)
+		log.Logf(0, "SSH NAT forwarding: host 127.0.0.1:%d -> guest:22", inst.SSHOptions.Port)
 	}
 
 	serialDir := filepath.Dir(inst.serialPath)
@@ -203,6 +215,36 @@ func (inst *instance) boot() error {
 			log.Logf(0, "failed to poke serial socket %s: %v", inst.serialPath, err)
 		}
 	}
+
+	var tee io.Writer
+	if inst.debug {
+		tee = os.Stdout
+	}
+	inst.merger = vmimpl.NewOutputMerger(tee)
+	inst.merger.Add("virtualbox", inst.rpipe)
+	inst.rpipe = nil
+
+	var bootOutput []byte
+	bootOutputStop := make(chan bool)
+	go func() {
+		for {
+			select {
+			case out := <-inst.merger.Output:
+				bootOutput = append(bootOutput, out...)
+			case <-bootOutputStop:
+				close(bootOutputStop)
+				return
+			}
+		}
+	}()
+	if err := vmimpl.WaitForSSH(10*time.Minute*inst.timeouts.Scale, inst.SSHOptions,
+		inst.os, inst.merger.Err, false, inst.debug); err != nil {
+		bootOutputStop <- true
+		<-bootOutputStop
+		return vmimpl.MakeBootError(err, bootOutput)
+	}
+	bootOutputStop <- true
+
 	return nil
 }
 
@@ -227,6 +269,12 @@ func (inst *instance) Close() error {
 	}
 	osutil.RunCmd(2*time.Minute, "", "VBoxManage", "unregistervm", inst.vmName, "--delete")
 	close(inst.closed)
+	if inst.rpipe != nil {
+		inst.rpipe.Close()
+	}
+	if inst.wpipe != nil {
+		inst.wpipe.Close()
+	}
 	return nil
 }
 
@@ -234,8 +282,8 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	base := filepath.Base(hostSrc)
 	vmDest := "/" + base
 
-	args := vmimpl.SCPArgs(inst.debug, inst.sshkey, inst.sshPort, false)
-	args = append(args, hostSrc, fmt.Sprintf("%v@127.0.0.1:%v", inst.sshuser, vmDest))
+	args := vmimpl.SCPArgs(inst.debug, inst.SSHOptions.Key, inst.SSHOptions.Port, false)
+	args = append(args, hostSrc, fmt.Sprintf("%v@127.0.0.1:%v", inst.SSHOptions.User, vmDest))
 
 	if inst.debug {
 		log.Logf(0, "running command: scp %#v", args)
@@ -257,13 +305,13 @@ func (inst *instance) Run(ctx context.Context, command string) (
 		dmesg = nil
 		return nil, nil, err
 	}
-	args := vmimpl.SSHArgs(inst.debug, inst.sshkey, inst.sshPort, false)
+	args := vmimpl.SSHArgs(inst.debug, inst.SSHOptions.Key, inst.SSHOptions.Port, false)
 	if inst.rpcPort != 0 {
 		proxy := fmt.Sprintf("%d:127.0.0.1:%d", inst.rpcPort, inst.rpcPort)
 		args = append(args, "-R", proxy)
 	}
 
-	args = append(args, fmt.Sprintf("%v@127.0.0.1", inst.sshuser), fmt.Sprintf("cd / && exec %v", command))
+	args = append(args, fmt.Sprintf("%v@127.0.0.1", inst.SSHOptions.User), fmt.Sprintf("cd / && exec %v", command))
 	if inst.debug {
 		log.Logf(0, "running command: ssh %#v", args)
 	}
