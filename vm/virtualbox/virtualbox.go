@@ -72,7 +72,7 @@ func (pool *Pool) Count() int { return pool.cfg.Count }
 
 func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.Instance, error) {
 	timestamp := strconv.FormatInt(time.Now().UnixNano(), 10)
-	serialPath := filepath.Join(workdir, timestamp, "serial")
+	serialPath := filepath.Join(workdir, "serial")
 	vmName := fmt.Sprintf("syzkaller_%s", timestamp)
 	inst := &instance{
 		cfg:        pool.cfg,
@@ -106,15 +106,7 @@ func (inst *instance) clone() error {
 		}
 		return err
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		if inst.debug {
-			log.Logf(0, "failed to listen on 127.0.0.1:0: %v", err)
-		}
-		return err
-	}
-	inst.sshPort = ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	inst.sshPort = vmimpl.UnusedTCPPort()
 	rule := fmt.Sprintf("syzkaller_pf_%d", inst.sshPort)
 	natArg := fmt.Sprintf("%s,tcp,,%d,,22", rule, inst.sshPort)
 	if inst.debug {
@@ -260,9 +252,10 @@ func (inst *instance) Run(ctx context.Context, command string) (
 	dmesg, err := net.Dial("unix", inst.serialPath)
 	if err != nil {
 		if inst.debug {
-			log.Logf(0, "serial console not available: %v; continuing without it", err)
+			log.Logf(0, "serial console not available: %v; returning an error", err)
 		}
 		dmesg = nil
+		return nil, nil, err
 	}
 	args := vmimpl.SSHArgs(inst.debug, inst.sshkey, inst.sshPort, false)
 	if inst.rpcPort != 0 {
@@ -289,6 +282,7 @@ func (inst *instance) Run(ctx context.Context, command string) (
 	cmd.Stderr = wpipe
 	if err := cmd.Start(); err != nil {
 		wpipe.Close()
+		rpipe.Close()
 		if dmesg != nil {
 			dmesg.Close()
 		}
@@ -296,7 +290,9 @@ func (inst *instance) Run(ctx context.Context, command string) (
 	}
 	wpipe.Close()
 	merger := vmimpl.NewOutputMerger(nil)
-	merger.Add("dmesg", dmesg)
+	if dmesg != nil {
+		merger.Add("dmesg", dmesg)
+	}
 	merger.Add("ssh", rpipe)
 
 	return vmimpl.Multiplex(ctx, cmd, merger, vmimpl.MultiplexConfig{
