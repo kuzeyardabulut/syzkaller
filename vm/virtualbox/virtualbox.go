@@ -5,7 +5,6 @@ package virtualbox
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -50,6 +49,7 @@ type instance struct {
 	merger     *vmimpl.OutputMerger
 	rpipe      io.ReadCloser
 	wpipe      io.WriteCloser
+	uartConn   net.Conn
 	vmimpl.SSHOptions
 }
 
@@ -163,40 +163,6 @@ func (inst *instance) clone() error {
 	return nil
 }
 
-// VirtualBox waits for a serial link during boot; this opens the socket so the VM can continue.
-func pokeSerialSocket(inst *instance, d time.Duration) error {
-	conn, err := net.Dial("unix", inst.serialPath)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	done := make(chan struct{})
-	deadline := time.Now().Add(d)
-
-	go func() {
-		defer close(done)
-		buf := make([]byte, 4096)
-
-		for {
-			_ = conn.SetReadDeadline(deadline)
-			if _, err := conn.Read(buf); err != nil {
-				var ne net.Error
-				if errors.As(err, &ne) && ne.Timeout() {
-					return
-				}
-				if !errors.Is(err, io.EOF) && inst.debug {
-					log.Logf(0, "serial read error: %v", err)
-				}
-				return
-			}
-		}
-	}()
-
-	<-done
-	return nil
-}
-
 func (inst *instance) boot() error {
 	if inst.debug {
 		log.Logf(0, "booting VM %q (headless)", inst.vmName)
@@ -210,11 +176,6 @@ func (inst *instance) boot() error {
 	}
 
 	time.Sleep(10 * time.Second)
-	if err := pokeSerialSocket(inst, 30*time.Second); err != nil {
-		if inst.debug {
-			log.Logf(0, "failed to poke serial socket %s: %v", inst.serialPath, err)
-		}
-	}
 
 	var tee io.Writer
 	if inst.debug {
@@ -223,6 +184,17 @@ func (inst *instance) boot() error {
 	inst.merger = vmimpl.NewOutputMerger(tee)
 	inst.merger.Add("virtualbox", inst.rpipe)
 	inst.rpipe = nil
+
+	// Connect to the serial console and add it to the merger
+	var err error
+	inst.uartConn, err = net.Dial("unix", inst.serialPath)
+	if err != nil {
+		if inst.debug {
+			log.Logf(0, "failed to connect to serial socket %s: %v", inst.serialPath, err)
+		}
+		return err
+	}
+	inst.merger.Add("dmesg", inst.uartConn)
 
 	var bootOutput []byte
 	bootOutputStop := make(chan bool)
@@ -297,13 +269,11 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 
 func (inst *instance) Run(ctx context.Context, command string) (
 	<-chan []byte, <-chan error, error) {
-	dmesg, err := net.Dial("unix", inst.serialPath)
-	if err != nil {
+	if inst.uartConn == nil {
 		if inst.debug {
-			log.Logf(0, "serial console not available: %v; returning an error", err)
+			log.Logf(0, "serial console not available; returning an error")
 		}
-		dmesg = nil
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("serial console not available")
 	}
 	args := vmimpl.SSHArgs(inst.debug, inst.SSHOptions.Key, inst.SSHOptions.Port, false)
 	if inst.rpcPort != 0 {
@@ -321,8 +291,8 @@ func (inst *instance) Run(ctx context.Context, command string) (
 		if inst.debug {
 			log.Logf(0, "LongPipe failed: %v", err)
 		}
-		if dmesg != nil {
-			dmesg.Close()
+		if inst.uartConn != nil {
+			inst.uartConn.Close()
 		}
 		return nil, nil, err
 	}
@@ -331,20 +301,17 @@ func (inst *instance) Run(ctx context.Context, command string) (
 	if err := cmd.Start(); err != nil {
 		wpipe.Close()
 		rpipe.Close()
-		if dmesg != nil {
-			dmesg.Close()
+		if inst.uartConn != nil {
+			inst.uartConn.Close()
 		}
 		return nil, nil, err
 	}
 	wpipe.Close()
-	merger := vmimpl.NewOutputMerger(nil)
-	if dmesg != nil {
-		merger.Add("dmesg", dmesg)
-	}
-	merger.Add("ssh", rpipe)
 
-	return vmimpl.Multiplex(ctx, cmd, merger, vmimpl.MultiplexConfig{
-		Console: dmesg,
+	inst.merger.Add("ssh", rpipe)
+
+	return vmimpl.Multiplex(ctx, cmd, inst.merger, vmimpl.MultiplexConfig{
+		Console: inst.uartConn,
 		Close:   inst.closed,
 		Debug:   inst.debug,
 		Scale:   inst.timeouts.Scale,
